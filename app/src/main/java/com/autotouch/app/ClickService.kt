@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -16,22 +17,44 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import kotlin.math.abs
+
+// NOTE: minSdk 26 chahiye (continueStroke ke liye)
+// accessibility_service_config.xml me: android:canPerformGestures="true"
 
 class ClickService : AccessibilityService() {
 
     companion object {
         var instance: ClickService? = null
+        private const val TAG = "ClickService"
     }
 
     private lateinit var wm: WindowManager
+
+    // UI
+    private var bubble: TextView? = null      // side ka chhota banda
     private var panel: View? = null
-    private val points = mutableListOf<TextView>()
-    private var editMode = true
-    private var busy = false
-    private var dragPx = 300f
-    private val dragMs = 300L
-    private val pointSize = 120
+    private var liveBtn: Button? = null
     private lateinit var distTxt: TextView
+    private val points = mutableListOf<TextView>()
+
+    // settings
+    private var editMode = true
+    private var dragPx = 300f
+    private val cycleMs = 300L                // ek swipe cycle ka time
+    private val pointSize = 120
+    private val bubbleSize = 110
+
+    // panel ki position yaad rakhne ke liye
+    private var panelX = 20
+    private var panelY = 300
+
+    // hold state
+    private var activeDot: View? = null
+    private var holding = false
+    private var lastStroke: GestureDescription.StrokeDescription? = null
+    private var gx = 0f
+    private var gy = 0f
 
     override fun onServiceConnected() {
         instance = this
@@ -59,6 +82,76 @@ class ClickService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
     }
+
+    // ---------------------------------------------------------------
+    // BUBBLE (chhota banda): tap = panel open/close, drag = move
+    // ---------------------------------------------------------------
+
+    /** Purane code se compatible: MainActivity yahi call kare to bubble aa jayega */
+    fun showPanel() = showBubble()
+
+    fun showBubble() {
+        if (bubble != null) return
+        val b = TextView(this).apply {
+            text = "◉"
+            textSize = 22f
+            setTextColor(Color.parseColor("#00E5FF"))
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#CC111111"))
+                setStroke(4, Color.parseColor("#00E5FF"))
+            }
+        }
+        val p = overlayParams(bubbleSize, bubbleSize)
+        p.x = 0
+        p.y = 400
+        wm.addView(b, p)
+        bubble = b
+        attachBubbleTouch(b)
+    }
+
+    private fun attachBubbleTouch(b: View) {
+        var sx = 0
+        var sy = 0
+        var tx = 0f
+        var ty = 0f
+        var moved = false
+        b.setOnTouchListener { v, e ->
+            val p = b.layoutParams as WindowManager.LayoutParams
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    sx = p.x; sy = p.y; tx = e.rawX; ty = e.rawY
+                    moved = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - tx
+                    val dy = e.rawY - ty
+                    if (abs(dx) > 12 || abs(dy) > 12) moved = true
+                    if (moved) {
+                        p.x = sx + dx.toInt()
+                        p.y = sy + dy.toInt()
+                        wm.updateViewLayout(b, p)
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) {
+                        v.performClick()
+                        togglePanel()
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    private fun togglePanel() {
+        if (panel == null) openPanel() else closePanel()
+    }
+
+    // ---------------------------------------------------------------
+    // PANEL
+    // ---------------------------------------------------------------
 
     private fun makeDraggable(handle: View, target: View) {
         var sx = 0
@@ -92,13 +185,8 @@ class ClickService : AccessibilityService() {
         }
     }
 
-    fun showPanel() {
+    private fun openPanel() {
         if (panel != null) return
-        editMode = true
-        points.forEach {
-            styleDot(it, false)
-            setTouchable(it, true)
-        }
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -119,7 +207,9 @@ class ClickService : AccessibilityService() {
         }
 
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row1.addView(smallBtn("✔") { goLive() })
+        val live = smallBtn(if (editMode) "✔" else "✏") { toggleLive() }
+        liveBtn = live
+        row1.addView(live)
         row1.addView(smallBtn("➕") { addPoint() })
         row1.addView(smallBtn("🗑") { clearPoints() })
         row1.addView(smallBtn("✖") { closeAll() })
@@ -153,12 +243,32 @@ class ClickService : AccessibilityService() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT
         )
-        p.x = 20
-        p.y = 300
+        p.x = panelX
+        p.y = panelY
         wm.addView(box, p)
         panel = box
         makeDraggable(handle, box)
     }
+
+    /** Sirf panel hatata hai, dots jaise the waise rehte hain */
+    private fun closePanel() {
+        panel?.let {
+            try {
+                val p = it.layoutParams as WindowManager.LayoutParams
+                panelX = p.x
+                panelY = p.y
+                wm.removeView(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "closePanel", e)
+            }
+        }
+        panel = null
+        liveBtn = null
+    }
+
+    // ---------------------------------------------------------------
+    // DOTS
+    // ---------------------------------------------------------------
 
     private fun styleDot(v: TextView, live: Boolean) {
         v.background = GradientDrawable().apply {
@@ -176,7 +286,7 @@ class ClickService : AccessibilityService() {
             textSize = 18f
             gravity = Gravity.CENTER
         }
-        styleDot(v, false)
+        styleDot(v, !editMode)
         val p = overlayParams(pointSize, pointSize)
         p.x = 300 + n * 30
         p.y = 600 + n * 30
@@ -193,6 +303,7 @@ class ClickService : AccessibilityService() {
         v.setOnTouchListener { _, e ->
             val p = v.layoutParams as WindowManager.LayoutParams
             if (editMode) {
+                // edit mode: dot ko drag karke fire button ke upar rakho
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
                         sx = p.x; sy = p.y; tx = e.rawX; ty = e.rawY
@@ -203,15 +314,25 @@ class ClickService : AccessibilityService() {
                         wm.updateViewLayout(v, p)
                     }
                 }
-            } else if (e.action == MotionEvent.ACTION_DOWN) {
-                fire(v)
+            } else {
+                // live mode: dabao = action shuru, hatao = action band
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> startHold(v)
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> stopHold(v)
+                }
             }
             true
         }
     }
 
     private fun clearPoints() {
-        points.forEach { try { wm.removeView(it) } catch (e: Exception) {} }
+        holding = false
+        lastStroke = null
+        activeDot = null
+        points.forEach {
+            try { wm.removeView(it) } catch (e: Exception) { Log.w(TAG, "clearPoints", e) }
+        }
         points.clear()
     }
 
@@ -224,53 +345,100 @@ class ClickService : AccessibilityService() {
                 p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
             }
             wm.updateViewLayout(v, p)
-        } catch (e: Exception) {}
-    }
-
-    private fun goLive() {
-        if (points.isEmpty()) {
-            Toast.makeText(this, "Pehle ➕ se point lagao", Toast.LENGTH_SHORT).show()
-            return
+        } catch (e: Exception) {
+            Log.w(TAG, "setTouchable", e)
         }
-        editMode = false
-        points.forEach { styleDot(it, true) }
-        panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
-        panel = null
     }
 
-    private fun fire(v: View) {
-        if (busy) return
-        busy = true
+    // ---------------------------------------------------------------
+    // LIVE / EDIT toggle (panel band hone par bhi dots chalte rehte hain)
+    // ---------------------------------------------------------------
+
+    private fun toggleLive() {
+        if (editMode) {
+            if (points.isEmpty()) {
+                Toast.makeText(this, "Pehle ➕ se point lagao", Toast.LENGTH_SHORT).show()
+                return
+            }
+            editMode = false
+        } else {
+            editMode = true
+        }
+        points.forEach { styleDot(it, !editMode) }
+        liveBtn?.text = if (editMode) "✔" else "✏"
+    }
+
+    // ---------------------------------------------------------------
+    // HOLD: dot dabao = swipe cycle repeat, ungli hatao = ruk jao
+    // Gesture dot ke center par hota hai (jahan fire button hai),
+    // isliye dot fire button ke saath hi kaam karta hai.
+    // ---------------------------------------------------------------
+
+    private fun startHold(v: View) {
+        if (activeDot != null) return
+        activeDot = v
+        holding = true
         val p = v.layoutParams as WindowManager.LayoutParams
-        val x = p.x + pointSize / 2f
-        val y = p.y + pointSize / 2f
+        gx = p.x + pointSize / 2f
+        gy = p.y + pointSize / 2f
+        // dot ko untouchable karo taki gesture neeche fire button tak pahunche
         setTouchable(v, false)
+        sendStroke(true)
+    }
 
+    private fun stopHold(v: View) {
+        if (activeDot === v) holding = false   // agla callback gesture ko khatam kar dega
+    }
+
+    private fun sendStroke(first: Boolean) {
+        val more = holding
         val path = Path().apply {
-            moveTo(x, y)
-            lineTo(x, (y - dragPx).coerceAtLeast(0f))
-            lineTo(x, y)
+            moveTo(gx, gy)
+            if (more) {
+                lineTo(gx, (gy - dragPx).coerceAtLeast(0f))
+                lineTo(gx, gy)
+            }
         }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, dragMs))
-            .build()
+        val dur = if (more) cycleMs else 10L
+        val stroke = if (first || lastStroke == null) {
+            GestureDescription.StrokeDescription(path, 0, dur, more)
+        } else {
+            lastStroke!!.continueStroke(path, 0, dur, more)
+        }
+        lastStroke = stroke
 
-        val ok = dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { finish(v) }
-            override fun onCancelled(g: GestureDescription?) { finish(v) }
-        }, null)
-        if (!ok) finish(v)
+        val ok = dispatchGesture(
+            GestureDescription.Builder().addStroke(stroke).build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) {
+                    if (more) sendStroke(false) else endHold()
+                }
+                override fun onCancelled(g: GestureDescription?) { endHold() }
+            },
+            null
+        )
+        if (!ok) endHold()
     }
 
-    private fun finish(v: View) {
-        busy = false
-        if (!editMode) setTouchable(v, true)
+    private fun endHold() {
+        holding = false
+        lastStroke = null
+        activeDot?.let { setTouchable(it, true) }
+        activeDot = null
     }
+
+    // ---------------------------------------------------------------
 
     private fun closeAll() {
+        holding = false
+        lastStroke = null
+        activeDot = null
         clearPoints()
-        panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
-        panel = null
+        closePanel()
+        bubble?.let {
+            try { wm.removeView(it) } catch (e: Exception) { Log.w(TAG, "closeAll", e) }
+        }
+        bubble = null
         editMode = true
     }
 }
