@@ -7,8 +7,6 @@ import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
-import android.os.Handler
-import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -26,16 +24,14 @@ class ClickService : AccessibilityService() {
     }
 
     private lateinit var wm: WindowManager
-    private val handler = Handler(Looper.getMainLooper())
     private var panel: View? = null
     private val points = mutableListOf<TextView>()
-    private var running = false
-    private var index = 0
-    private var delayMs = 500L
-    private val dragPx = 300f
+    private var editMode = true
+    private var busy = false
+    private var dragPx = 300f
+    private val dragMs = 300L
     private val pointSize = 120
-    private lateinit var playBtn: Button
-    private lateinit var delayTxt: TextView
+    private lateinit var distTxt: TextView
 
     override fun onServiceConnected() {
         instance = this
@@ -85,8 +81,24 @@ class ClickService : AccessibilityService() {
         }
     }
 
+    private fun smallBtn(label: String, action: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 14f
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(24, 8, 24, 8)
+            setOnClickListener { action() }
+        }
+    }
+
     fun showPanel() {
         if (panel != null) return
+        editMode = true
+        points.forEach {
+            styleDot(it, false)
+            setTouchable(it, true)
+        }
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -107,8 +119,7 @@ class ClickService : AccessibilityService() {
         }
 
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        playBtn = smallBtn("▶") { toggle() }
-        row1.addView(playBtn)
+        row1.addView(smallBtn("✔") { goLive() })
         row1.addView(smallBtn("➕") { addPoint() })
         row1.addView(smallBtn("🗑") { clearPoints() })
         row1.addView(smallBtn("✖") { closeAll() })
@@ -117,21 +128,21 @@ class ClickService : AccessibilityService() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        delayTxt = TextView(this).apply {
-            text = "${delayMs}ms"
+        distTxt = TextView(this).apply {
+            text = "↑${dragPx.toInt()}"
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER
             setPadding(16, 0, 16, 0)
         }
         row2.addView(smallBtn("−") {
-            if (delayMs > 100) delayMs -= 100
-            delayTxt.text = "${delayMs}ms"
+            if (dragPx > 50f) dragPx -= 50f
+            distTxt.text = "↑${dragPx.toInt()}"
         })
-        row2.addView(delayTxt)
+        row2.addView(distTxt)
         row2.addView(smallBtn("+") {
-            delayMs += 100
-            delayTxt.text = "${delayMs}ms"
+            if (dragPx < 1000f) dragPx += 50f
+            distTxt.text = "↑${dragPx.toInt()}"
         })
 
         box.addView(handle)
@@ -149,115 +160,117 @@ class ClickService : AccessibilityService() {
         makeDraggable(handle, box)
     }
 
-    private fun smallBtn(label: String, action: () -> Unit): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 14f
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(24, 8, 24, 8)
-            setOnClickListener { action() }
+    private fun styleDot(v: TextView, live: Boolean) {
+        v.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor(if (live) "#4400E5FF" else "#9900E5FF"))
+            setStroke(4, Color.parseColor("#B400FF"))
         }
     }
 
     private fun addPoint() {
-        if (running) return
         val n = points.size
         val v = TextView(this).apply {
             text = "${n + 1}"
             setTextColor(Color.WHITE)
             textSize = 18f
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#9900E5FF"))
-                setStroke(4, Color.parseColor("#B400FF"))
-            }
         }
+        styleDot(v, false)
         val p = overlayParams(pointSize, pointSize)
         p.x = 300 + n * 30
         p.y = 600 + n * 30
         wm.addView(v, p)
         points.add(v)
-        makeDraggable(v, v)
+        attachPointTouch(v)
+    }
+
+    private fun attachPointTouch(v: View) {
+        var sx = 0
+        var sy = 0
+        var tx = 0f
+        var ty = 0f
+        v.setOnTouchListener { _, e ->
+            val p = v.layoutParams as WindowManager.LayoutParams
+            if (editMode) {
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = p.x; sy = p.y; tx = e.rawX; ty = e.rawY
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        p.x = sx + (e.rawX - tx).toInt()
+                        p.y = sy + (e.rawY - ty).toInt()
+                        wm.updateViewLayout(v, p)
+                    }
+                }
+            } else if (e.action == MotionEvent.ACTION_DOWN) {
+                fire(v)
+            }
+            true
+        }
     }
 
     private fun clearPoints() {
-        stopRun()
         points.forEach { try { wm.removeView(it) } catch (e: Exception) {} }
         points.clear()
     }
 
     private fun setTouchable(v: View, touchable: Boolean) {
-        val p = v.layoutParams as WindowManager.LayoutParams
-        p.flags = if (touchable) {
-            p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        } else {
-            p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        }
-        wm.updateViewLayout(v, p)
+        try {
+            val p = v.layoutParams as WindowManager.LayoutParams
+            p.flags = if (touchable) {
+                p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            } else {
+                p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            }
+            wm.updateViewLayout(v, p)
+        } catch (e: Exception) {}
     }
 
-    private fun toggle() {
-        if (running) stopRun() else startRun()
-    }
-
-    private fun startRun() {
+    private fun goLive() {
         if (points.isEmpty()) {
             Toast.makeText(this, "Pehle ➕ se point lagao", Toast.LENGTH_SHORT).show()
             return
         }
-        running = true
-        index = 0
-        playBtn.text = "⏸"
-        points.forEach { setTouchable(it, false) }
-        step()
+        editMode = false
+        points.forEach { styleDot(it, true) }
+        panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+        panel = null
     }
 
-    private fun stopRun() {
-        running = false
-        handler.removeCallbacksAndMessages(null)
-        if (panel != null) playBtn.text = "▶"
-        points.forEach { setTouchable(it, true) }
-    }
-
-    private fun step() {
-        if (!running || points.isEmpty()) return
-        val v = points[index]
+    private fun fire(v: View) {
+        if (busy) return
+        busy = true
         val p = v.layoutParams as WindowManager.LayoutParams
         val x = p.x + pointSize / 2f
         val y = p.y + pointSize / 2f
-        clickAndDrag(x, y) {
-            handler.postDelayed({
-                index = (index + 1) % points.size
-                step()
-            }, delayMs)
-        }
-    }
+        setTouchable(v, false)
 
-    private fun clickAndDrag(x: Float, y: Float, onDone: () -> Unit) {
-        val tap = Path().apply { moveTo(x, y) }
-        val drag = Path().apply {
+        val path = Path().apply {
             moveTo(x, y)
             lineTo(x, (y - dragPx).coerceAtLeast(0f))
             lineTo(x, y)
         }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(tap, 0, 50))
-            .addStroke(GestureDescription.StrokeDescription(drag, 60, 400))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, dragMs))
             .build()
+
         val ok = dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { onDone() }
-            override fun onCancelled(g: GestureDescription?) { onDone() }
+            override fun onCompleted(g: GestureDescription?) { finish(v) }
+            override fun onCancelled(g: GestureDescription?) { finish(v) }
         }, null)
-        if (!ok) onDone()
+        if (!ok) finish(v)
+    }
+
+    private fun finish(v: View) {
+        busy = false
+        if (!editMode) setTouchable(v, true)
     }
 
     private fun closeAll() {
-        stopRun()
-        points.forEach { try { wm.removeView(it) } catch (e: Exception) {} }
-        points.clear()
+        clearPoints()
         panel?.let { try { wm.removeView(it) } catch (e: Exception) {} }
         panel = null
+        editMode = true
     }
 }
