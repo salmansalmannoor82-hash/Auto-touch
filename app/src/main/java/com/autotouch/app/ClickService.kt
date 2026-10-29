@@ -2,6 +2,7 @@ package com.autotouch.app
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.animation.ValueAnimator
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Path
@@ -13,6 +14,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.animation.LinearInterpolator
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -52,7 +54,10 @@ class ClickService : AccessibilityService() {
     // hold state
     private var activeDot: View? = null
     private var holding = false
-    private var lastStroke: GestureDescription.StrokeDescription? = null
+    private var lastStroke: GestureDescription.StrokeDescription? = null      // drag stroke
+    private var lastHoldStroke: GestureDescription.StrokeDescription? = null  // fire button dabaye rakhne wala stroke
+    private var anim: ValueAnimator? = null
+    private var baseY = 0
     private var gx = 0f
     private var gy = 0f
 
@@ -379,6 +384,9 @@ class ClickService : AccessibilityService() {
         activeDot = v
         holding = true
         val p = v.layoutParams as WindowManager.LayoutParams
+        baseY = p.y
+        lastStroke = null
+        lastHoldStroke = null
         gx = p.x + pointSize / 2f
         gy = p.y + pointSize / 2f
         // dot ko untouchable karo taki gesture neeche fire button tak pahunche
@@ -392,23 +400,37 @@ class ClickService : AccessibilityService() {
 
     private fun sendStroke(first: Boolean) {
         val more = holding
-        val path = Path().apply {
+        val targetY = (gy - dragPx).coerceAtLeast(0f)
+
+        // 1) hold stroke: dot ke neeche wala button (fire) dabaye rakhta hai
+        val holdPath = Path().apply { moveTo(gx, gy) }
+        // 2) drag stroke: wahin se upar drag karke wapas aata hai
+        val dragPath = Path().apply {
             moveTo(gx, gy)
             if (more) {
-                lineTo(gx, (gy - dragPx).coerceAtLeast(0f))
+                lineTo(gx, targetY)
                 lineTo(gx, gy)
             }
         }
         val dur = if (more) cycleMs else 10L
-        val stroke = if (first || lastStroke == null) {
-            GestureDescription.StrokeDescription(path, 0, dur, more)
+
+        val hold = if (first || lastHoldStroke == null) {
+            GestureDescription.StrokeDescription(holdPath, 0, dur, more)
         } else {
-            lastStroke!!.continueStroke(path, 0, dur, more)
+            lastHoldStroke!!.continueStroke(holdPath, 0, dur, more)
         }
-        lastStroke = stroke
+        val drag = if (first || lastStroke == null) {
+            GestureDescription.StrokeDescription(dragPath, 0, dur, more)
+        } else {
+            lastStroke!!.continueStroke(dragPath, 0, dur, more)
+        }
+        lastHoldStroke = hold
+        lastStroke = drag
+
+        if (more) animateDot(gy - targetY)
 
         val ok = dispatchGesture(
-            GestureDescription.Builder().addStroke(stroke).build(),
+            GestureDescription.Builder().addStroke(hold).addStroke(drag).build(),
             object : GestureResultCallback() {
                 override fun onCompleted(g: GestureDescription?) {
                     if (more) sendStroke(false) else endHold()
@@ -420,10 +442,40 @@ class ClickService : AccessibilityService() {
         if (!ok) endHold()
     }
 
+    /** Dot khudi upar jata hai aur wapas aata hai (drag dikhane ke liye) */
+    private fun animateDot(delta: Float) {
+        val v = activeDot ?: return
+        anim?.cancel()
+        anim = ValueAnimator.ofFloat(0f, delta, 0f).apply {
+            duration = cycleMs
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                try {
+                    val p = v.layoutParams as WindowManager.LayoutParams
+                    p.y = baseY - (it.animatedValue as Float).toInt()
+                    wm.updateViewLayout(v, p)
+                } catch (e: Exception) {
+                    Log.w(TAG, "animateDot", e)
+                }
+            }
+            start()
+        }
+    }
+
     private fun endHold() {
         holding = false
         lastStroke = null
-        activeDot?.let { setTouchable(it, true) }
+        lastHoldStroke = null
+        anim?.cancel()
+        anim = null
+        activeDot?.let {
+            try {
+                (it.layoutParams as WindowManager.LayoutParams).y = baseY
+            } catch (e: Exception) {
+                Log.w(TAG, "endHold", e)
+            }
+            setTouchable(it, true)   // updateViewLayout bhi yahin ho jata hai
+        }
         activeDot = null
     }
 
